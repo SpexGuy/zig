@@ -310,15 +310,18 @@ pub fn allocAdvancedWithRetAddr(
 pub fn resize(self: *Allocator, old_mem: anytype, new_n: usize) Error!@TypeOf(old_mem) {
     const Slice = @typeInfo(@TypeOf(old_mem)).Pointer;
     const T = Slice.child;
+    if (@sizeOf([*]T) == 0) {
+        return @as([*]T, undefined)[0..new_n];
+    }
     if (new_n == 0) {
         self.free(old_mem);
-        return &[0]T{};
+        return @as([]T, @as(*[0]T, undefined));
     }
     const old_byte_slice = mem.sliceAsBytes(old_mem);
     const new_byte_count = math.mul(usize, @sizeOf(T), new_n) catch return Error.OutOfMemory;
     const rc = try self.resizeFn(self, old_byte_slice, Slice.alignment, new_byte_count, 0, @returnAddress());
     assert(rc == new_byte_count);
-    const new_byte_slice = old_mem.ptr[0..new_byte_count];
+    const new_byte_slice = old_byte_slice.ptr[0..new_byte_count];
     return mem.bytesAsSlice(T, new_byte_slice);
 }
 
