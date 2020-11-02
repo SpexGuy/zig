@@ -132,8 +132,81 @@ fn failAllocatorAlloc(self: *Allocator, n: usize, alignment: u29, len_align: u29
 }
 
 test "mem.Allocator basics" {
-    testing.expectError(error.OutOfMemory, failAllocator.alloc(u8, 1));
-    testing.expectError(error.OutOfMemory, failAllocator.allocSentinel(u8, 1, 0));
+    const TestInstantiateAllocator = struct {
+        fn expectSlice(pointer: usize, length: usize, slice: anytype) void {
+            testing.expectEqual(length, slice.len);
+            if (@sizeOf(@TypeOf(slice.ptr)) != 0 and length != 0) {
+                testing.expectEqual(pointer, @ptrToInt(slice.ptr));
+            }
+        }
+        pub fn runTest(comptime T: type, comptime sentinel: ?T) !void {
+            var bad_pointer: usize = undefined;
+            var slice: []T = if (@sizeOf(T) == 0) blk: {
+                // workaround for #6934
+                var array: *[4]T = undefined;
+                break :blk array;
+            } else blk: {
+                bad_pointer = @truncate(usize, 0xDEADBEEFDEADBEEF) *% @alignOf(T);
+                break :blk @intToPtr([*]T, bad_pointer)[0..4];
+            };
+
+            testing.expectError(error.OutOfMemory, failAllocator.alloc(T, 4));
+            testing.expectError(error.OutOfMemory, failAllocator.create(T));
+            testing.expectError(error.OutOfMemory, failAllocator.dupe(T, slice));
+            if (@typeInfo(T) == .Int) {
+                // dupeZ assumes 0 is a valid sentinel, so only works for integer types.
+                testing.expectError(error.OutOfMemory, failAllocator.dupeZ(T, slice));
+            }
+            if (sentinel) |s| {
+                testing.expectError(error.OutOfMemory, failAllocator.allocSentinel(T, 1, s));
+            }
+
+            testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, null, sentinel));
+            testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, null, null));
+
+            expectSlice(bad_pointer, 2, failAllocator.shrink(slice, 2));
+
+            testing.expectError(error.OutOfMemory, failAllocator.realloc(slice, 6));
+            expectSlice(bad_pointer, 2, try failAllocator.realloc(slice, 2));
+            expectSlice(bad_pointer, 0, try failAllocator.realloc(slice, 0));
+
+            testing.expectError(error.OutOfMemory, failAllocator.resize(slice, 6));
+            expectSlice(bad_pointer, 2, try failAllocator.resize(slice, 2));
+            expectSlice(bad_pointer, 0, try failAllocator.resize(slice, 0));
+
+            failAllocator.free(slice);
+            failAllocator.destroy(&slice[0]);
+
+            if (@sizeOf(T) != 0) {
+                // zero-sized types don't have alignment
+                const big_align = @alignOf(T) * 2;
+                const normal_align = @alignOf(T);
+                const small_align = comptime std.math.max(@alignOf(T) / 2, 1);
+
+                testing.expectError(error.OutOfMemory, failAllocator.alignedAlloc(T, big_align, 4));
+                testing.expectError(error.OutOfMemory, failAllocator.alignedAlloc(T, normal_align, 4));
+                testing.expectError(error.OutOfMemory, failAllocator.alignedAlloc(T, small_align, 4));
+
+                testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, big_align, sentinel));
+                testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, big_align, null));
+                testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, normal_align, sentinel));
+                testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, normal_align, null));
+                testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, small_align, sentinel));
+                testing.expectError(error.OutOfMemory, failAllocator.allocWithOptions(T, 4, small_align, null));
+
+                expectSlice(bad_pointer, 2, failAllocator.alignedShrink(slice, small_align, 2));
+                expectSlice(bad_pointer, 2, failAllocator.alignedShrink(slice, @alignOf(T), 2));
+            }
+        }
+    };
+
+    // instantiate with byte type
+    try TestInstantiateAllocator.runTest(u8, 0);
+    // instantiate with larger type
+    try TestInstantiateAllocator.runTest(u32, 0);
+    // instantiate with zero-sized type
+    // don't try to use a sentinel, that could break lots of things
+    try TestInstantiateAllocator.runTest(void, null);
 }
 
 /// Copy all of source into dest at position 0.

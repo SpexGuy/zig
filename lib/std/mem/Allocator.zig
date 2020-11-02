@@ -217,9 +217,10 @@ pub fn allocWithOptionsRetAddr(
 
 fn AllocWithOptionsPayload(comptime Elem: type, comptime alignment: ?u29, comptime sentinel: ?Elem) type {
     if (sentinel) |s| {
+        // Assume that sentinels imply the type is not zero-sized
         return [:s]align(alignment orelse @alignOf(Elem)) Elem;
     } else {
-        return []align(alignment orelse @alignOf(Elem)) Elem;
+        return SafeSlice(Elem, alignment);
     }
 }
 
@@ -247,7 +248,7 @@ pub fn alignedAlloc(
     /// null means naturally aligned
     comptime alignment: ?u29,
     n: usize,
-) Error![]align(alignment orelse @alignOf(T)) T {
+) Error!SafeSlice(T, alignment) {
     return self.allocAdvancedWithRetAddr(T, alignment, n, .exact, @returnAddress());
 }
 
@@ -258,7 +259,7 @@ pub fn allocAdvanced(
     comptime alignment: ?u29,
     n: usize,
     exact: Exact,
-) Error![]align(alignment orelse @alignOf(T)) T {
+) Error!SafeSlice(T, alignment) {
     return self.allocAdvancedWithRetAddr(T, alignment, n, exact, @returnAddress());
 }
 
@@ -272,7 +273,11 @@ pub fn allocAdvancedWithRetAddr(
     n: usize,
     exact: Exact,
     return_address: usize,
-) Error![]align(alignment orelse @alignOf(T)) T {
+) Error!SafeSlice(T, alignment) {
+    if (@sizeOf(T) == 0) {
+        return @as([*]T, undefined)[0..n];
+    }
+
     const a = if (alignment) |a| blk: {
         if (a == @alignOf(T)) return allocAdvancedWithRetAddr(self, T, null, n, exact, return_address);
         break :blk a;
@@ -335,19 +340,13 @@ pub fn resize(self: *Allocator, old_mem: anytype, new_n: usize) Error!@TypeOf(ol
 /// in `std.ArrayList.shrink`.
 /// If you need guaranteed success, call `shrink`.
 /// If `new_n` is 0, this is the same as `free` and it always succeeds.
-pub fn realloc(self: *Allocator, old_mem: anytype, new_n: usize) t: {
-    const Slice = @typeInfo(@TypeOf(old_mem)).Pointer;
-    break :t Error![]align(Slice.alignment) Slice.child;
-} {
-    const old_alignment = @typeInfo(@TypeOf(old_mem)).Pointer.alignment;
+pub fn realloc(self: *Allocator, old_mem: anytype, new_n: usize) Error!DerivedSlice(@TypeOf(old_mem), safeAlignment(@TypeOf(old_mem))) {
+    const old_alignment = comptime safeAlignment(@TypeOf(old_mem));
     return self.reallocAdvancedWithRetAddr(old_mem, old_alignment, new_n, .exact, @returnAddress());
 }
 
-pub fn reallocAtLeast(self: *Allocator, old_mem: anytype, new_n: usize) t: {
-    const Slice = @typeInfo(@TypeOf(old_mem)).Pointer;
-    break :t Error![]align(Slice.alignment) Slice.child;
-} {
-    const old_alignment = @typeInfo(@TypeOf(old_mem)).Pointer.alignment;
+pub fn reallocAtLeast(self: *Allocator, old_mem: anytype, new_n: usize) Error!DerivedSlice(@TypeOf(old_mem), safeAlignment(@TypeOf(old_mem))) {
+    const old_alignment = comptime safeAlignment(@TypeOf(old_mem));
     return self.reallocAdvancedWithRetAddr(old_mem, old_alignment, new_n, .at_least, @returnAddress());
 }
 
@@ -357,23 +356,30 @@ pub fn reallocAtLeast(self: *Allocator, old_mem: anytype, new_n: usize) t: {
 pub fn reallocAdvanced(
     self: *Allocator,
     old_mem: anytype,
-    comptime new_alignment: u29,
+    comptime new_alignment: ?u29,
     new_n: usize,
     exact: Exact,
-) Error![]align(new_alignment) @typeInfo(@TypeOf(old_mem)).Pointer.child {
+) Error!DerivedSlice(@TypeOf(old_mem), new_alignment) {
     return self.reallocAdvancedWithRetAddr(old_mem, new_alignment, new_n, exact, @returnAddress());
 }
 
 pub fn reallocAdvancedWithRetAddr(
     self: *Allocator,
     old_mem: anytype,
-    comptime new_alignment: u29,
+    comptime new_alignment_safe: ?u29,
     new_n: usize,
     exact: Exact,
     return_address: usize,
-) Error![]align(new_alignment) @typeInfo(@TypeOf(old_mem)).Pointer.child {
+) Error!DerivedSlice(@TypeOf(old_mem), new_alignment_safe) {
     const Slice = @typeInfo(@TypeOf(old_mem)).Pointer;
     const T = Slice.child;
+    if (@sizeOf(T) == 0) {
+        return @as([*]T, undefined)[0..new_n];
+    }
+
+    // can't do this until after check for zero-sized child
+    const new_alignment = new_alignment_safe orelse Slice.alignment;
+
     if (old_mem.len == 0) {
         return self.allocAdvancedWithRetAddr(T, new_alignment, new_n, exact, return_address);
     }
@@ -398,23 +404,20 @@ pub fn reallocAdvancedWithRetAddr(
 /// Shrink always succeeds, and `new_n` must be <= `old_mem.len`.
 /// Returned slice has same alignment as old_mem.
 /// Shrinking to 0 is the same as calling `free`.
-pub fn shrink(self: *Allocator, old_mem: anytype, new_n: usize) t: {
-    const Slice = @typeInfo(@TypeOf(old_mem)).Pointer;
-    break :t []align(Slice.alignment) Slice.child;
-} {
-    const old_alignment = @typeInfo(@TypeOf(old_mem)).Pointer.alignment;
+pub fn shrink(self: *Allocator, old_mem: anytype, new_n: usize) SafeSlice(@TypeOf(old_mem), safeAlignment(@TypeOf(old_mem))) {
+    const old_alignment = comptime safeAlignment(@TypeOf(old_mem));
     return self.alignedShrinkWithRetAddr(old_mem, old_alignment, new_n, @returnAddress());
 }
 
 /// This is the same as `shrink`, except caller may additionally request
 /// a new alignment, which must be smaller or the same as the old
-/// allocation.
+/// allocation.  This function does not support zero-sized types.
 pub fn alignedShrink(
     self: *Allocator,
     old_mem: anytype,
     comptime new_alignment: u29,
     new_n: usize,
-) []align(new_alignment) @typeInfo(@TypeOf(old_mem)).Pointer.child {
+) DerivedSlice(@TypeOf(old_mem), new_alignment) {
     return self.alignedShrinkWithRetAddr(old_mem, new_alignment, new_n, @returnAddress());
 }
 
@@ -424,17 +427,24 @@ pub fn alignedShrink(
 pub fn alignedShrinkWithRetAddr(
     self: *Allocator,
     old_mem: anytype,
-    comptime new_alignment: u29,
+    comptime new_alignment_safe: ?u29,
     new_n: usize,
     return_address: usize,
-) []align(new_alignment) @typeInfo(@TypeOf(old_mem)).Pointer.child {
+) DerivedSlice(@TypeOf(old_mem), new_alignment_safe)  {
     const Slice = @typeInfo(@TypeOf(old_mem)).Pointer;
     const T = Slice.child;
 
     if (new_n == old_mem.len)
         return old_mem;
     assert(new_n < old_mem.len);
-    assert(new_alignment <= Slice.alignment);
+
+    if (@sizeOf(T) == 0) {
+        return old_mem[0..new_n];
+    }
+
+    // can't do this until after the check for zero-size
+    const new_alignment = new_alignment_safe orelse Slice.alignment;
+    if (new_alignment > Slice.alignment) @compileError("alignedShrink* cannot increase alignment.");
 
     // Here we skip the overflow checking on the multiplication because
     // new_n <= old_mem.len and the multiplication didn't overflow for that operation.
@@ -490,3 +500,41 @@ pub fn shrinkBytes(
     assert(new_len <= buf.len);
     return self.resizeFn(self, buf, buf_align, new_len, len_align, return_address) catch unreachable;
 }
+
+/// This function is meant to be called at comptime.
+/// It returns the alignment of a pointer or slice type,
+/// or null if the child is a zero-sized type.
+/// Use SafeSlice to construct a slice type.
+fn safeAlignment(comptime PtrOrSliceT: type) ?u29 {
+    comptime {
+        if (@sizeOf(@typeInfo(PtrOrSliceT).Pointer.child) == 0) {
+            return null;
+        } else {
+            return @typeInfo(PtrOrSliceT).Pointer.alignment;
+        }
+    }
+}
+
+/// Constructs a slice type with given alignment and child type.
+/// Provides a helpful compile error if a zero-sized type is aligned.
+fn SafeSlice(comptime ChildT: type, comptime alignment: ?u29) type {
+    if (@sizeOf(ChildT) == 0) {
+        if (alignment != null) @compileError(std.fmt.comptimePrint(
+            "Cannot align zero-sized type {}. (requested alignment: {})",
+            .{ @typeName(T), alignment.? },
+        ));
+        return []ChildT;
+    } else {
+        if (alignment) |a| {
+            return []align(a) ChildT;
+        } else {
+            return []ChildT;
+        }
+    }
+}
+
+/// Constructs an aligned slice from a slice type and a desired alignment.
+fn DerivedSlice(comptime PtrOrSliceT: type, comptime alignment: ?u29) type {
+    return SafeSlice(@typeInfo(PtrOrSliceT).Pointer.child, alignment);
+}
+
